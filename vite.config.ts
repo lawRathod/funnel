@@ -3,9 +3,24 @@ import solid from 'vite-plugin-solid'
 import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
+  base: '/funnel/',
   plugins: [solid(), tailwindcss()],
   build: {
     target: 'esnext',
+    outDir: 'dist/funnel',
+    rollupOptions: {
+      output: {
+        advancedChunks: {
+          groups: [{ name: 'ort', test: /@huggingface\/transformers/ }],
+        },
+        assetFileNames: (info) => {
+          if (info.name?.endsWith('.wasm')) {
+            return 'assets/[name][extname]';
+          }
+          return 'assets/[name]-[hash][extname]';
+        },
+      },
+    },
     // depth chunk + ort wasm are lazy-loaded on first Convert, not first paint.
     chunkSizeWarningLimit: 3000,
   },

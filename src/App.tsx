@@ -8,6 +8,7 @@ import {
   AlertTriangle,
   Image as ImageIcon,
   Brain,
+  Film,
 } from "lucide-solid";
 import Dropzone from "./components/Dropzone";
 import SettingsPanel from "./components/SettingsPanel";
@@ -22,6 +23,7 @@ import {
   renderSbsFromDepth,
 } from "./lib/sbs";
 import type { OutputFormat, PipelineStatus } from "./lib/types";
+import type { VideoCodec, VideoContainer, VideoMeta } from "./lib/video";
 
 const SAMPLE_URL = "https://picsum.photos/seed/depthsbs-3d/1280/800";
 
@@ -47,6 +49,18 @@ export default function App() {
   const [sbsMs, setSbsMs] = createSignal<number | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [loadingSample, setLoadingSample] = createSignal(false);
+
+  // Video → SBS state (image path above stays untouched).
+  const [mediaKind, setMediaKind] = createSignal<"image" | "video">("image");
+  const [videoUrl, setVideoUrl] = createSignal<string>("");
+  const [videoName, setVideoName] = createSignal<string>("");
+  const [videoMeta, setVideoMeta] = createSignal<VideoMeta | null>(null);
+  const [container, setContainer] = createSignal<VideoContainer>("mp4");
+  const [codec, setCodec] = createSignal<VideoCodec>("x264");
+  const [vBusy, setVBusy] = createSignal(false);
+  const [vStage, setVStage] = createSignal<string | null>(null);
+  const [vFrac, setVFrac] = createSignal<number | null>(null);
+  const [videoOutUrl, setVideoOutUrl] = createSignal<string | null>(null);
 
   let depthCanvasRef: HTMLCanvasElement | undefined;
   let sbsCanvasRef: HTMLCanvasElement | undefined;
@@ -76,14 +90,47 @@ export default function App() {
   const handleFile = async (f: File) => {
     try {
       setError(null);
+      if (f.type.startsWith("video/")) {
+        await handleVideoFile(f);
+        return;
+      }
       const img = await loadFileAsImage(f);
       if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
       const url = URL.createObjectURL(f);
       lastObjectUrl = url;
+      clearVideo();
+      setMediaKind("image");
       setSource(img, url, f.name);
     } catch (e) {
-      setError(`Could not load image: ${errMsg(e)}`);
+      setError(`Could not load file: ${errMsg(e)}`);
     }
+  };
+
+  const clearVideo = () => {
+    const out = videoOutUrl();
+    if (out) URL.revokeObjectURL(out);
+    // NB: videoUrl() object URLs are revoked on replace/reset, not here,
+    // so the <video> preview keeps working after selection.
+    setVideoUrl("");
+    setVideoName("");
+    setVideoMeta(null);
+    setVStage(null);
+    setVFrac(null);
+    setVideoOutUrl(null);
+  };
+
+  const handleVideoFile = async (f: File) => {
+    const { probeVideoObjectUrl } = await import("./lib/video");
+    if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+    const url = URL.createObjectURL(f);
+    lastObjectUrl = url;
+    const meta = await probeVideoObjectUrl(url);
+    clearVideo();
+    setMediaKind("video");
+    setVideoUrl(url);
+    setVideoName(f.name);
+    setVideoMeta({ url, ...meta });
+    setStatus("idle");
   };
 
   const handleSample = async () => {
@@ -215,11 +262,89 @@ export default function App() {
     setDepth(null);
     srcCanvas = null;
     srcPixels = null;
+    clearVideo();
+    setMediaKind("image");
     setStatus("idle");
     setProgress(null);
     setDepthMs(null);
     setSbsMs(null);
     setError(null);
+  };
+
+  // Video → SBS: sample frames, depth + warp each, encode via ffmpeg.wasm.
+  // ponytail: even sampling, ≤480 frames @ 30fps, ≤512px wide, silent output;
+  // raise caps / keep audio when quality demands it.
+  const handleConvertVideo = async () => {
+    const meta = videoMeta();
+    const url = videoUrl();
+    if (!meta || !url || vBusy()) return;
+    const model = DEPTH_MODELS.find((m) => m.id === modelId()) ?? DEPTH_MODELS[0];
+    setVBusy(true);
+    setError(null);
+    const out = videoOutUrl();
+    if (out) URL.revokeObjectURL(out);
+    setVideoOutUrl(null);
+    try {
+      const { getDepthEstimator, estimateDepth } = await import("./lib/depth");
+      const { sampleVideoFrames, canvasToJpegBytes, encodeFramesToVideo } = await import("./lib/video");
+
+      setVStage("Loading depth model");
+      setVFrac(null);
+      const devices: ("webgpu" | "wasm")[] = webGpu() ? ["webgpu", "wasm"] : ["wasm"];
+      let estimator = null;
+      let loadErr: unknown = null;
+      for (const dev of devices) {
+        try {
+          estimator = await getDepthEstimator(model, dev, (f) => {
+            if (Number.isFinite(f)) setVFrac(f * 0.1);
+          });
+          setUsedDevice(dev);
+          loadErr = null;
+          break;
+        } catch (e) {
+          loadErr = e;
+        }
+      }
+      if (!estimator) throw new Error(`Could not load the depth model: ${errMsg(loadErr)}`);
+
+      setVStage("Sampling frames");
+      const { frames, fps } = await sampleVideoFrames(url);
+      const sbsCanvas = document.createElement("canvas");
+      const jpgs: Uint8Array[] = [];
+      for (let i = 0; i < frames.length; i++) {
+        setVStage(`Depth + SBS · frame ${i + 1}/${frames.length}`);
+        setVFrac(0.1 + (0.7 * i) / frames.length);
+        const fc = frames[i];
+        const pixels = fc.getContext("2d")!.getImageData(0, 0, fc.width, fc.height);
+        const depthRes = await estimateDepth(estimator, fc);
+        renderSbsFromDepth(pixels, depthRes.norm, {
+          baseline: baseline(),
+          swapEyes: swapEyes(),
+          format: format(),
+        }, sbsCanvas);
+        if (i === 0 && sbsCanvasRef) {
+          sbsCanvasRef.width = sbsCanvas.width;
+          sbsCanvasRef.height = sbsCanvas.height;
+          sbsCanvasRef.getContext("2d")!.drawImage(sbsCanvas, 0, 0);
+        }
+        jpgs.push(await canvasToJpegBytes(sbsCanvas));
+      }
+
+      setVStage(`Encoding ${container().toUpperCase()} · ${codec()} (ffmpeg.wasm, slow)`);
+      setVFrac(0.85);
+      const blob = await encodeFramesToVideo(jpgs, fps, container(), codec(), (msg) => {
+        if (/x265|error|failed/i.test(msg)) console.warn("[depthsbs] ffmpeg:", msg);
+      });
+      setVFrac(1);
+      setVideoOutUrl(URL.createObjectURL(blob));
+      setVStage("Done");
+    } catch (e) {
+      console.error("[depthsbs] video convert failed", e);
+      setError(errMsg(e));
+      setVStage("Failed");
+    } finally {
+      setVBusy(false);
+    }
   };
 
   const busy = () => status() === "loading-model" || status() === "estimating-depth" || status() === "rendering";
@@ -269,11 +394,11 @@ export default function App() {
             Browser-only 2D → 3D
           </p>
           <h1 class="text-4xl sm:text-5xl font-semibold tracking-tight text-balance">
-            Turn any 2D photo into 3D SBS
+            Turn 2D photos & video into 3D SBS
           </h1>
           <p class="opacity-60 mt-3 text-[15px]">
             On-device depth estimation. No uploads, no queue — export side-by-side
-            for VR headsets and 3D TVs.
+            PNG or {"MP4 / MKV (x264 / x265)"} for VR headsets and 3D TVs.
           </p>
 
           <ul class="steps steps-horizontal w-full max-w-md mx-auto mt-6 text-xs">
@@ -300,8 +425,23 @@ export default function App() {
               onFile={handleFile}
               onSample={handleSample}
               loadingSample={loadingSample()}
-              hasImage={!!sourceImg()}
+              hasImage={!!sourceImg() || !!videoMeta()}
             />
+            {/* Media toggle — reflects what was dropped */}
+            <div class="join w-full">
+              <button
+                class={`btn btn-sm join-item flex-1 ${mediaKind() === "image" ? "btn-active" : ""}`}
+                onClick={() => setMediaKind("image")}
+              >
+                Photo
+              </button>
+              <button
+                class={`btn btn-sm join-item flex-1 ${mediaKind() === "video" ? "btn-active" : ""}`}
+                onClick={() => setMediaKind("video")}
+              >
+                <Film size={14} /> Video
+              </button>
+            </div>
             <SettingsPanel
               baseline={baseline()}
               setBaseline={setBaseline}
@@ -314,6 +454,39 @@ export default function App() {
               webGpu={webGpu()}
             />
 
+            <Show when={mediaKind() === "video"}>
+              <div class="grid grid-cols-2 gap-2">
+                <label class="form-control">
+                  <span class="label label-text text-[11px] opacity-60">Container</span>
+                  <select
+                    class="select select-sm select-bordered"
+                    value={container()}
+                    onChange={(e) => setContainer(e.currentTarget.value as VideoContainer)}
+                  >
+                    <option value="mp4">MP4</option>
+                    <option value="mkv">MKV</option>
+                  </select>
+                </label>
+                <label class="form-control">
+                  <span class="label label-text text-[11px] opacity-60">Codec</span>
+                  <select
+                    class="select select-sm select-bordered"
+                    value={codec()}
+                    onChange={(e) => setCodec(e.currentTarget.value as VideoCodec)}
+                  >
+                    <option value="x264">x264 (fast)</option>
+                    <option value="x265">x265 (slow)</option>
+                  </select>
+                </label>
+              </div>
+              <p class="text-[11px] opacity-50">
+                30 fps · ≤480 frames · ≤512px · silent · x265 is 5–10× slower in wasm.
+              </p>
+            </Show>
+
+            <Show
+              when={mediaKind() === "video"}
+              fallback={
             <button
               class="btn btn-primary w-full"
               onClick={handleConvert}
@@ -326,6 +499,21 @@ export default function App() {
               )}
               {status() === "done" ? "Re-run depth" : "Convert to 3D"}
             </button>
+              }
+            >
+              <button
+                class="btn btn-primary w-full"
+                onClick={handleConvertVideo}
+                disabled={!videoMeta() || vBusy()}
+              >
+                {vBusy() ? (
+                  <span class="loading loading-spinner loading-sm" />
+                ) : (
+                  <Wand2 size={16} />
+                )}
+                Convert video to 3D
+              </button>
+            </Show>
             <div class="flex items-center justify-between">
               <p class="text-[11px] opacity-50">
                 Model downloads once (~30 MB), then runs offline.
@@ -333,8 +521,8 @@ export default function App() {
               <button
                 class="btn btn-xs btn-ghost opacity-60"
                 onClick={handleReset}
-                disabled={!sourceImg()}
-                title="Clear image"
+                disabled={!sourceImg() && !videoMeta()}
+                title="Clear"
               >
                 <RotateCcw size={12} /> Reset
               </button>
@@ -359,6 +547,22 @@ export default function App() {
                   {sourceImg()?.naturalWidth} × {sourceImg()?.naturalHeight}
                 </span>
               </Show>
+              <Show when={mediaKind() === "video" && videoMeta()}>
+                <span class="opacity-60">
+                  {vStage() ?? "Video ready"} · {Math.round(videoMeta()!.duration)}s · {videoMeta()!.width}×{videoMeta()!.height}
+                </span>
+              </Show>
+              <Show when={mediaKind() === "video" && vBusy()}>
+                {Number.isFinite(vFrac()) ? (
+                  <progress
+                    class="progress progress-neutral w-full mt-1"
+                    value={Math.round(vFrac()! * 100)}
+                    max="100"
+                  />
+                ) : (
+                  <progress class="progress progress-neutral w-full mt-1" max="100" />
+                )}
+              </Show>
               <Show when={busy()}>
                 {Number.isFinite(progress()) ? (
                   <progress
@@ -375,8 +579,68 @@ export default function App() {
             </div>
 
             <div class="p-5 flex flex-col gap-5">
+              <Show when={mediaKind() === "video"}>
+                <Show
+                  when={videoMeta()}
+                  fallback={
+                    <div class="rounded-xl bg-base-200/50 min-h-[360px] flex flex-col items-center justify-center gap-3 text-center p-8">
+                      <div class="opacity-30">
+                        <Film size={28} />
+                      </div>
+                      <p class="font-medium text-sm">No video yet</p>
+                      <p class="text-sm opacity-50 max-w-xs">
+                        Drop an MP4 / MKV / WebM — frames are sampled, depth-warped,
+                        and encoded to SBS {container().toUpperCase()} ({codec()}).
+                      </p>
+                    </div>
+                  }
+                >
+                  <div class="grid gap-5 md:grid-cols-2">
+                    <div>
+                      <p class="text-[11px] font-medium uppercase tracking-widest opacity-45 mb-2">
+                        Input video
+                      </p>
+                      <video
+                        src={videoUrl()}
+                        controls
+                        muted
+                        playsinline
+                        class="rounded-xl w-full max-h-[360px] bg-base-200/60 border border-base-content/10"
+                      />
+                      <p class="text-[11px] opacity-50 mt-1">{videoName()}</p>
+                    </div>
+                    <div>
+                      <p class="text-[11px] font-medium uppercase tracking-widest opacity-45 mb-2">
+                        3D SBS preview (first frame)
+                      </p>
+                      <canvas
+                        ref={sbsCanvasRef}
+                        class="sbs-canvas rounded-xl w-full max-h-[360px] object-contain bg-base-200/60 border border-base-content/10"
+                      />
+                    </div>
+                  </div>
+                  <Show when={videoOutUrl()}>
+                    <div>
+                      <p class="text-[11px] font-medium uppercase tracking-widest opacity-45 mb-2">
+                        3D SBS output · {container().toUpperCase()} {codec()}
+                      </p>
+                      <video
+                        src={videoOutUrl()!}
+                        controls
+                        playsinline
+                        class="rounded-xl w-full max-h-[400px] bg-black border border-base-content/10"
+                      />
+                      <div class="mt-3">
+                        <a class="btn btn-primary btn-sm" href={videoOutUrl()!} download={`${videoName().replace(/\.[a-z0-9]+$/i, "") || "video"}.sbs-${format()}.${container()}`}>
+                          <Download size={14} /> Download {container().toUpperCase()}
+                        </a>
+                      </div>
+                    </div>
+                  </Show>
+                </Show>
+              </Show>
               <Show
-                when={sourceImg()}
+                when={mediaKind() === "image" && sourceImg()}
                 fallback={
                   <div class="rounded-xl bg-base-200/50 min-h-[360px] flex flex-col items-center justify-center gap-3 text-center p-8">
                     <div class="opacity-30">
@@ -464,7 +728,7 @@ export default function App() {
           {[
             { t: "Images", d: "JPG / PNG / WebP → depth + SBS Half & Full, eye swap, strength.", on: true },
             { t: "Depth", d: "Depth Anything V2 Small on WebGPU, q4 quantized, WASM fallback.", on: true },
-            { t: "Next", d: "Anaglyph, depth color ramps, video → 3D SBS.", on: false },
+            { t: "Video", d: "MP4 / MKV in → SBS MP4 / MKV out, x264 or x265, 30 fps, silent.", on: true },
           ].map((c) => (
             <div class="rounded-2xl border border-base-content/10 p-4">
               <p class="text-[11px] font-medium uppercase tracking-widest opacity-45">

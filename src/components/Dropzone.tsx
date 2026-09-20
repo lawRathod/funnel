@@ -16,7 +16,7 @@ export default function Dropzone(props: Props) {
     e.preventDefault();
     setDragOver(false);
     const f = e.dataTransfer?.files?.[0];
-    if (f && f.type.startsWith("image/")) props.onFile(f);
+    if (f && (f.type.startsWith("image/") || f.type.startsWith("video/"))) props.onFile(f);
   };
 
   return (
@@ -37,7 +37,7 @@ export default function Dropzone(props: Props) {
       <input
         ref={inputRef}
         type="file"
-        accept="image/png,image/jpeg,image/webp"
+        accept="image/png,image/jpeg,image/webp,video/mp4,video/x-matroska,video/webm,video/*"
         class="hidden"
         onChange={(e) => {
           const f = e.currentTarget.files?.[0];
@@ -51,10 +51,10 @@ export default function Dropzone(props: Props) {
         </div>
         <div>
           <p class="font-semibold">
-            {props.hasImage ? "Drop a new image to replace" : "Drop your 2D image here"}
+            {props.hasImage ? "Drop a new file to replace" : "Drop your 2D image or video here"}
           </p>
           <p class="text-sm opacity-60 mt-1">
-            or <span class="link link-primary">click to browse</span> · JPG / PNG / WebP · stays on-device
+            or <span class="link link-primary">click to browse</span> · JPG / PNG / WebP / MP4 / MKV · stays on-device
           </p>
         </div>
         <button
